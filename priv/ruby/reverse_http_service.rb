@@ -2,14 +2,16 @@
 #
 # First hack at creating a ruby ReverseHTTP client - see http://www.reversehttp.net/
 #
-# Sean O'Halpin, 2009-10-03
-#
+# Author: Sean O'Halpin, 2009-10-03
+#--
 # TODO: sort out 'remove_port' issue
 # TODO: tidy up/refactor
+# TODO: use Rack::Client?
 # TODO: better recovery from failed HTTP requests
 # TODO: turn into proper library and separate clients (maybe runner with plugins - cf. mqp)
 # TODO: keyword initializers
 # TODO: docs
+#++
 
 require 'pp'
 require 'restclient'
@@ -19,7 +21,7 @@ require 'thin/request'
 require 'rack'
 require 'base64'
 
-#Thread.abort_on_exception = true
+Thread.abort_on_exception = true
 RestClient.log = "stdout"
 
 # if ENV["http_proxy"]
@@ -122,6 +124,7 @@ module ReverseHTTP
     attr_reader :name
     attr_reader :token
     attr_reader :server_url
+    attr_reader :proxy
     attr_reader :public_url
     attr_reader :private_url
     attr_reader :next_request
@@ -139,11 +142,12 @@ module ReverseHTTP
     # env hash and returning an array containing [status, headers,
     # body].
     #
-    def initialize(*args, &block)
-      @verbose = false
-      @remove_port = false
-      if args.size > 0
-        register(*args)
+    # TODO: keyword args
+    def initialize(kwargs = { }, &block)
+      @verbose = kwargs[:verbose]
+      @strip_port = kwargs[:strip_port]
+      if kwargs.size > 0
+        register(kwargs)
         if block_given?
           serve_forever(&block)
         end
@@ -167,7 +171,7 @@ module ReverseHTTP
           result[rel] = url
         end
       end
-      if @remove_port
+      if @strip_port
         result.each do |key, value|
           result[key] = value.gsub(/:8000/, '')
         end
@@ -178,11 +182,20 @@ module ReverseHTTP
     private :parse_link_headers
 
     # register namespace with reversehttp gateway
-    def register(name, server_url = "http://localhost:8000/reversehttp", token = "-", lease = 30)
-      @name = name
-      @token = token
-      @server_url = server_url
-      @lease = lease
+    def register(kwargs)
+      args = {
+        :name => nil,
+        :server_url => "http://localhost:8000/reversehttp",
+        :proxy => nil,
+        :token => "-",
+        :lease => 30,
+      }.merge(kwargs)
+
+      @name         = args[:name]
+      @token        = args[:token]
+      @server_url   = args[:server_url]
+      @proxy = args[:proxy]
+      @lease        = args[:lease]
       _register
     end
 
@@ -192,7 +205,7 @@ module ReverseHTTP
       puts "Registering"
       payload = {:name => @name, :token => @token, :lease => @lease }
       # TODO: recovery
-      res = RestClient::Request.execute(:method => :post, :url => @server_url, :payload => payload, :raw_response => true)
+      res = RestClient::Request.execute(:method => :post, :url => @server_url, :payload => payload, :raw_response => true, :proxy => @proxy)
       #res = RestClient.post(@server_url, payload)
       dump_request(res) if @verbose
       links = parse_link_headers(res)
@@ -206,23 +219,30 @@ module ReverseHTTP
     private :_register
 
     # reply to caller
-    def reply(request, reply_url, &block)
+    def reply(server, request, reply_url, &block)
       # send to caller
-      RestClient.post(reply_url,
-                      ReverseHTTP::Response.new(*block.call(ReverseHTTP::Request.new(self, request).env)).payload,
-                      { :content_type => request.headers[:content_type] })
+#       RestClient.post(reply_url,
+#                       ReverseHTTP::Response.new(*block.call(ReverseHTTP::Request.new(self, request).env)).payload,
+#                       { :content_type => request.headers[:content_type] })
+      RestClient::Request.execute(
+                                  :method => :post,
+                                  :url => reply_url,
+                                  :proxy => server.proxy,
+                                  :payload => ReverseHTTP::Response.new(*block.call(ReverseHTTP::Request.new(self, request).env)).payload,
+                                  :headers => { :content_type => request.headers[:content_type] }
+                                  )
     end
 
     # fetch next request from gateway
     def fetch_next
       begin
-        request = RestClient::Request.execute(:method => :get, :url => @next_request, :raw_response => true)
+        request = RestClient::Request.execute(:method => :get, :url => @next_request, :raw_response => true, :proxy => @proxy)
         puts "SERVE"
         #dump_request(request)
         # TODO: handle other response codes
         while request.code == 204      # timeout
           _register
-          request = RestClient::Request.execute(:method => :get, :url => @next_request, :raw_response => true)
+          request = RestClient::Request.execute(:method => :get, :url => @next_request, :raw_response => true, :proxy => @proxy)
           #dump_request(request)
         end
       rescue => e
@@ -240,13 +260,13 @@ module ReverseHTTP
       [request, reply_url]
     end
 
-    # serve a single request, calling block to process it.
-    # the block is a Rack-compatible handler
+    # Serve a single request, calling block to process it.
+    # +block+ is a Rack-compatible handler, taking a hash +env+ and returning <tt>[status, headers, body]</tt>.
     def serve(&block)
       request, reply_url = fetch_next
       Thread.start {
         begin
-          reply(request, reply_url, &block)
+          reply(self, request, reply_url, &block)
         rescue Exception => e
           puts "Exception in #serve replying to client - #{e.class}: #{e}"
         end
@@ -293,13 +313,22 @@ end
 
 # relay HTTP requests
 def relay(name = "relay", server_url = "http://localhost:8000/reversehttp", headers = { })
-  client = ReverseHTTP::Client.new(name, server_url, "-", 60) do |env|
+  headers = headers.dup
+  client = ReverseHTTP::Client.new(:name => name, :server_url => server_url, :token => "-", :lease => 60, :proxy => ENV['http_proxy']) do |env|
+    if headers[:user] && headers[:password]
+      user = headers.delete(:user)
+      password = headers.delete(:password)
+      auth_header = "Basic " + Base64.encode64(user + ":" + password)
+      headers = headers.merge({"Authorization" => auth_header})
+    end
     begin
       request = RestClient::Request.execute(:method => :get,
                                             :url => env["reversehttp.path_info"],
                                             :headers => headers,
-                                            :raw_response => true)
-      #dump_request(request)
+                                            :raw_response => true
+                                            )
+      p [:after_request]
+      dump_request(request)
       [request.code, request.headers, request.to_s]
     rescue RestClient::ResourceNotFound => e
       [404, { }, "Not found\r\n"]
